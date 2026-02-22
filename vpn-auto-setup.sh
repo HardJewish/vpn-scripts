@@ -2,7 +2,7 @@
 
 # ========================================
 # Автоматическая установка 3X-UI с VLESS + Reality
-# Версия: 1.0
+# Версия: 2.0
 # ========================================
 
 set -e
@@ -92,17 +92,40 @@ sleep 5
 # ========================================
 echo -e "${GREEN}[4/6] Генерация ключей Reality...${NC}"
 
-# Установить xray-core если нужно
-if ! command -v xray &> /dev/null; then
+# Определяем путь к xray (используем xray из 3X-UI, не ставим отдельный)
+XRAY_BIN=""
+for p in /usr/local/x-ui/bin/xray-linux-* /usr/local/bin/xray; do
+    if [ -x "$p" ] 2>/dev/null; then
+        XRAY_BIN="$p"
+        break
+    fi
+done
+
+if [ -z "$XRAY_BIN" ]; then
+    echo -e "${RED}xray не найден! Устанавливаем...${NC}"
     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    XRAY_BIN="/usr/local/bin/xray"
 fi
 
-# Генерация ключей Reality
-KEYS=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYS" | grep "Private key:" | awk '{print $3}')
-PUBLIC_KEY=$(echo "$KEYS" | grep "Public key:" | awk '{print $3}')
+echo "Используем xray: $XRAY_BIN"
+
+# Генерация ключей Reality (совместимо с xray 24.x / 25.x / 26.x)
+KEYS=$($XRAY_BIN x25519)
+
+# xray 24.x: "Private key: xxx" / "Public key: yyy"
+# xray 25+:  "PrivateKey: xxx"  / "Password: yyy"
+PRIVATE_KEY=$(echo "$KEYS" | grep -i "private" | awk '{print $NF}')
+PUBLIC_KEY=$(echo "$KEYS" | grep -iE "^(Public key|Password):" | awk '{print $NF}')
+
+if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo -e "${RED}Ошибка генерации ключей!${NC}"
+    echo "Вывод xray x25519:"
+    echo "$KEYS"
+    exit 1
+fi
+
 SHORT_ID=$(openssl rand -hex 8)
-UUID=$(xray uuid)
+UUID=$($XRAY_BIN uuid)
 
 echo "Private Key: $PRIVATE_KEY"
 echo "Public Key: $PUBLIC_KEY"
@@ -110,68 +133,92 @@ echo "Short ID: $SHORT_ID"
 echo "UUID: $UUID"
 
 # ========================================
-# 5. Создание VLESS inbound через API
+# 5. Добавление VLESS inbound через API 3X-UI
 # ========================================
 echo -e "${GREEN}[5/6] Настройка VLESS + Reality...${NC}"
 
-# Получить токен сессии (логин в панель)
-sleep 3
-
-# JSON конфиг для inbound
-INBOUND_JSON=$(cat <<EOF
-{
-  "enable": true,
-  "port": $VLESS_PORT,
-  "protocol": "vless",
-  "settings": {
-    "clients": [
-      {
-        "id": "$UUID",
-        "email": "client1",
-        "flow": "xtls-rprx-vision"
-      }
-    ],
-    "decryption": "none"
-  },
-  "streamSettings": {
-    "network": "tcp",
-    "security": "reality",
-    "realitySettings": {
-      "show": false,
-      "dest": "$SNI_DOMAIN:443",
-      "xver": 0,
-      "serverNames": [
-        "$SNI_DOMAIN",
-        "www.cloudflare.com",
-        "www.apple.com"
-      ],
-      "privateKey": "$PRIVATE_KEY",
-      "shortIds": [
-        "$SHORT_ID",
-        ""
-      ]
-    }
-  },
-  "sniffing": {
-    "enabled": true,
-    "destOverride": [
-      "http",
-      "tls",
-      "quic"
-    ]
-  },
-  "remark": "VLESS-Reality-Auto"
-}
-EOF
-)
-
-# Сохранить конфиг во временный файл
-echo "$INBOUND_JSON" > /tmp/inbound.json
-
-# Добавить через x-ui CLI (если доступно)
-if command -v x-ui &> /dev/null; then
-    x-ui restart
+# Отключаем standalone xray чтобы не конфликтовал с 3X-UI
+if systemctl is-active --quiet xray 2>/dev/null; then
+    echo "Останавливаем standalone xray (конфликт портов с 3X-UI)..."
+    systemctl stop xray
+    systemctl disable xray
 fi
+
+# Ждём запуска панели
+echo "Ждём запуска 3X-UI..."
+for i in $(seq 1 30); do
+    if curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PANEL_PORT/login" | grep -q "200"; then
+        break
+    fi
+    sleep 2
+done
+
+# Определяем реальный порт панели (3X-UI может использовать другой порт)
+ACTUAL_PORT=$PANEL_PORT
+if ! curl -s -o /dev/null "http://localhost:$PANEL_PORT/login" 2>/dev/null; then
+    # Ищем порт в конфиге x-ui
+    for try_port in $PANEL_PORT 2053 2054 2055; do
+        if curl -s -o /dev/null "http://localhost:$try_port/login" 2>/dev/null; then
+            ACTUAL_PORT=$try_port
+            break
+        fi
+    done
+fi
+
+echo "Порт API: $ACTUAL_PORT"
+
+# Логин в 3X-UI API
+LOGIN_RESPONSE=$(curl -s -c /tmp/xui-cookies.txt \
+    -X POST "http://localhost:$ACTUAL_PORT/login" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=${PANEL_USER}&password=${PANEL_PASS}")
+
+LOGIN_OK=$(echo "$LOGIN_RESPONSE" | jq -r '.success // false')
+if [ "$LOGIN_OK" != "true" ]; then
+    echo -e "${RED}Не удалось авторизоваться в 3X-UI API!${NC}"
+    echo "Ответ: $LOGIN_RESPONSE"
+    echo -e "${YELLOW}Добавьте inbound вручную через панель: http://$PUBLIC_IP:$PANEL_PORT${NC}"
+else
+    echo "Авторизация в API успешна"
+
+    # Формируем JSON для API (settings и streamSettings как экранированные строки)
+    SETTINGS=$(jq -n -c \
+        --arg uuid "$UUID" \
+        '{clients: [{id: $uuid, flow: "xtls-rprx-vision", email: "client1", limitIp: 0, totalGB: 0, expiryTime: 0, enable: true}], decryption: "none", fallbacks: []}')
+
+    STREAM_SETTINGS=$(jq -n -c \
+        --arg sni "$SNI_DOMAIN" \
+        --arg privkey "$PRIVATE_KEY" \
+        --arg sid "$SHORT_ID" \
+        '{network: "tcp", security: "reality", externalProxy: [], realitySettings: {show: false, xver: 0, dest: ($sni + ":443"), serverNames: [$sni], privateKey: $privkey, minClient: "", maxClient: "", maxTimediff: 0, shortIds: [$sid]}, tcpSettings: {acceptProxyProtocol: false, header: {type: "none"}}}')
+
+    SNIFFING='{"enabled":true,"destOverride":["http","tls","quic"],"metadataOnly":false,"routeOnly":false}'
+
+    API_RESPONSE=$(curl -s -b /tmp/xui-cookies.txt \
+        -X POST "http://localhost:$ACTUAL_PORT/panel/api/inbounds/add" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n -c \
+            --arg settings "$SETTINGS" \
+            --arg stream "$STREAM_SETTINGS" \
+            --arg sniff "$SNIFFING" \
+            --argjson port "$VLESS_PORT" \
+            '{up: 0, down: 0, total: 0, remark: "VLESS-Reality", enable: true, expiryTime: 0, listen: "", port: $port, protocol: "vless", settings: $settings, streamSettings: $stream, sniffing: $sniff}')")
+
+    API_OK=$(echo "$API_RESPONSE" | jq -r '.success // false')
+    if [ "$API_OK" = "true" ]; then
+        echo -e "${GREEN}Inbound VLESS Reality успешно добавлен в 3X-UI!${NC}"
+    else
+        echo -e "${RED}Ошибка добавления inbound: $API_RESPONSE${NC}"
+        echo -e "${YELLOW}Добавьте inbound вручную через панель${NC}"
+    fi
+
+    # Перезапустить xray через 3X-UI
+    x-ui restart 2>/dev/null || true
+    sleep 3
+fi
+
+# Очистка cookies
+rm -f /tmp/xui-cookies.txt
 
 # ========================================
 # 6. Генерация URL и QR-кода
@@ -179,7 +226,7 @@ fi
 echo -e "${GREEN}[6/6] Генерация конфигурации клиента...${NC}"
 
 # URL для клиента
-VLESS_URL="vless://${UUID}@${PUBLIC_IP}:${VLESS_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#3X-UI-Auto"
+VLESS_URL="vless://${UUID}@${PUBLIC_IP}:${VLESS_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#VLESS-Reality"
 
 # Сохранить конфиг
 CONFIG_FILE="/root/vless-config.txt"
@@ -236,13 +283,17 @@ qrencode -o /root/vless-qr.png "$VLESS_URL"
 echo -e "${GREEN}QR-код сохранён: /root/vless-qr.png${NC}"
 echo ""
 
-# Напоминание
+# Проверка что всё работает
+echo -e "${YELLOW}=== Проверка ===${NC}"
+if ss -tlnp | grep -q ":$VLESS_PORT "; then
+    echo -e "${GREEN}✅ Порт $VLESS_PORT слушается${NC}"
+else
+    echo -e "${RED}❌ Порт $VLESS_PORT не слушается! Проверьте: x-ui log${NC}"
+fi
+
+echo ""
 echo -e "${YELLOW}⚠️  ВАЖНО:${NC}"
 echo "1. Сохраните файл: $CONFIG_FILE"
 echo "2. Смените пароль панели после первого входа!"
-echo "3. Откройте панель: http://$PUBLIC_IP:$PANEL_PORT"
-echo "4. В настройках inbound включите Sniffing для полного VPN"
-echo ""
-echo -e "${GREEN}Для просмотра конфига: cat $CONFIG_FILE${NC}"
-echo -e "${GREEN}Для показа QR в терминале: qrencode -t ANSIUTF8 < <(echo '$VLESS_URL')${NC}"
+echo "3. Панель: http://$PUBLIC_IP:$PANEL_PORT"
 echo ""
